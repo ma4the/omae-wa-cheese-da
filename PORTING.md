@@ -6,90 +6,100 @@ To move to another device, replace build specific constants in src/exploit.c
 
 Everything else (GPU R/W, Dirty Pagetable, DEFEX handling, init-hook etc..) is Samsung generic.
 
-## Edit in src/exploit.c
+All inputs are extracted offline from firmware 
 
-### A. KASLR symbols/signature
+## Quick start (one script)
 
-Update:
+Put `boot.img`, `kallsyms.txt`, `init` in one folder and run:
 
-- `FW_STEXT_VA`
-- `FW_SWAPPER_PG_DIR_VA`
-- `FW_INIT_TASK_VA`
-- `FW_SELINUX_STATE_VA`
-- `FW_STEXT_SIG1`
-- `FW_STEXT_SIG2`
+```bash
+helpers/port_extract.py        # reads boot.img, kallsyms.txt, init in the cwd
+```
+
+It prints every `#define` listed below. Needs `python3`, `readelf`, `pahole` (`apt install dwarves`)
+
+How to get the three inputs? Follow below!  
+
+## From firmware 
+
+```bash
+# download firmware from https://samfw.com  ->  AP_*.tar.md5   (boot.img + super.img are in AP) 
+tar xf AP_*.tar.md5
+lz4 -d boot.img.lz4 boot.img
+lz4 -d super.img.lz4 super.img
+
+# init  (for the init-hook offsets)
+simg2img super.img super.raw && lpunpack super.raw .       # -> system.img
+#   pull /system/bin/init out of system.img (mount it, or 7z/debugfs)
+
+# kernel + kallsyms.txt  (the kernel Image lives inside boot.img)
+git clone https://github.com/osm0sis/mkbootimg && (cd mkbootimg && gcc -O3 unpackbootimg.c -o unpackbootimg)
+./mkbootimg/unpackbootimg -i boot.img -o out/              # -> out/boot.img-kernel (already a raw Image)
+gcc cheese-cake/helpers/extract-kallsyms.c -o ek && ./ek out/boot.img-kernel   # -> kallsyms.txt
+#   (or: pipx install vmlinux-to-elf ; vmlinux-to-elf out/boot.img-kernel vmlinux ; readelf -sW vmlinux)
+```
+
+Then run `helpers/port_extract.py`, or do each group by hand below.
+
+(The script carves the kernel from boot.img itself, so for the manual commands use `out/boot.img-kernel` as `kernel`)
+
+## Extract each offset by hand
+
+### KASLR symbols/signature
+
+- `FW_STEXT_VA` 
+- `FW_SWAPPER_PG_DIR_VA` 
+- `FW_INIT_TASK_VA` 
+- `FW_SELINUX_STATE_VA` 
+- `SAMSUNG_LINEAR_MAP_BASE` 
+- `SAMSUNG_STEXT_OFFSET` 
+- `FW_STEXT_SIG1` 
+- `FW_STEXT_SIG2` 
 - `expected_words[6]`
 
-Get symbol VAs by running cheese-cake helpers/extract-kallsyms.c on the boot kernel and grepping the symbols.
+```bash
+grep -wE '_text|_stext|swapper_pg_dir|init_task|selinux_state' kallsyms.txt   # FW_*_VA + base
+xxd -s 0x10000 -l 24 -e -g4 kernel                                      # first 6 words of _stext
+```
+`expected_words[6]` = those 6 words; `FW_STEXT_SIG1`/`SIG2` = the first two 64-bit words.
 
-Get the signature by dumping the first 6 words of `_stext`
+`SAMSUNG_LINEAR_MAP_BASE` = `_text` (kernel base); `SAMSUNG_STEXT_OFFSET` = `_stext` − `_text` (usually 0x10000, which is also the signature's file offset in the Image) 
 
-### B. Physical base / spray
+### Struct offsets
 
-Update only if needed:
+- `OFFSETOF_TASK_STRUCT_TASKS`, `_MM`, `_PID` 
+- `OFFSETOF_MM_PGD`, `_START_CODE`, `_END_CODE`
 
-- `KERNEL_PHYS_BASE`
-- the scan window in `find_fw_stext_for_chain`
-- `gPhyAddrs[]`
-
-Usually leave this group as-is
-
-KERNEL_PHYS_BASE is 0xa8000000 on modern SoCs, and the binary already auto-sweeps gPhyAddrs[] on each run through maybe_retry. CHEESE_ATTEMPT is only an optional manual start index.
-
-Revisit this only if every attempt fails. cheese-cake helpers/find_phyaddr.c (root required) can suggest candidates.
-
-### C. Struct offsets
-
-Update:
-
-- `OFFSETOF_TASK_STRUCT_TASKS`
-- `OFFSETOF_TASK_STRUCT_MM`
-- `OFFSETOF_TASK_STRUCT_PID`
-- `OFFSETOF_MM_PGD`
-- `OFFSETOF_MM_START_CODE`
-- `OFFSETOF_MM_END_CODE`
-
-Run cheese-cake helpers/extract_struct_offsets.sh <vmlinux>
-
-It omits start_code / end_code, so get those separately with:
+The kernel embeds BTF; carve it, then pahole:
 
 ```bash
-pahole -C mm_struct
+python3 -c "d=open('kernel','rb').read();i=d.find(b'\x9f\xeb\x01\x00');import struct;h,_,_,so,sl=struct.unpack_from('<IIIII',d,i+4);open('kernel.btf','wb').write(d[i:i+h+so+sl])"
+pahole -C task_struct kernel.btf   # tasks, mm, pid
+pahole -C mm_struct  kernel.btf    # pgd, start_code, end_code
 ```
+Read the decimal offset in each member's `/* offset size */` comment.
+(vmlinux-to-elf is NOT enough here.. it only restores symbols, it drops BTF, so pahole gets nothing)
 
-or pull device BTF after permissive:
+### Init-hook
 
-```bash
-adb pull /sys/kernel/btf/vmlinux
-```
-
-### D. Init-hook
-
-Update:
-
-- `INIT_TEXT_FILE_VA`
-- `INIT_HOOK_PATCH_FILE_VA` (`__system_property_update@plt`)
-- `INIT_HOOK_PATCH_EXPECT0..3`
-- `INIT_HOOK_CAVE_FILE_VA`
+- `INIT_TEXT_FILE_VA` 
+- `INIT_HOOK_PATCH_FILE_VA` 
+- `INIT_HOOK_PATCH_EXPECT0..3` 
+- `INIT_HOOK_CAVE_FILE_VA` 
 - `INIT_HOOK_CAVE_EXPECT0`
 
-Load /system/bin/init in Decompiler and identify:
+```bash
+readelf -lW init | grep 'R E'                      # INIT_TEXT_FILE_VA = the LOAD VirtAddr
+readelf -rW init | grep __system_property_update   # the @plt GOT slot
+```
+The PLT stub that loads that slot (`adrp x16` / `ldr x17` / `add x16` / `br x17`) gives
+`INIT_HOOK_PATCH_FILE_VA` + `EXPECT0..3`. `INIT_HOOK_CAVE_FILE_VA` = zero padding at the end of
+the exec segment (need 248 bytes); `INIT_HOOK_CAVE_EXPECT0` = 0 
 
-- the PLT stub file VA and its 4 expected words,
-- a zero-padding cave after the executable LOAD segment,
-- the executable LOAD segment p_vaddr
+### Physical base 
 
-## Images (offline)
-
-Firmware: download via SamFw.. 
-
-For A:
-
-- boot.img -> magiskboot unpack -> kernel
-
-For D:
-
-- super.img -> lpunpack -> simg2img -> system -> /system/bin/init
+`KERNEL_PHYS_BASE` is `0xA8000000` on SM8550 and most recent Snapdragon, and the binary auto-sweeps
+`gPhyAddrs[]`, so usually leave it
 
 ## SELinux
 
@@ -99,12 +109,10 @@ If this option is disabled (e.g. S24 Ultra), that field is absent and the write 
 
 In that case, manipulate the policy instead, such as forging an ebitmap node or setting allow_unknown.
 
-Check:
-
 ```bash
 adb shell zcat /proc/config.gz | grep CONFIG_SECURITY_SELINUX_DEVELOP
 ```
 
-## Build / Run? 
+## Build / Run?
 
 See README.md
