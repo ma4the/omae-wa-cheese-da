@@ -46,7 +46,9 @@ and $04, $12, 0x7
 
 # Build & usage
 
-`exploit.c` is built for F731NKSU5EYD9. For other firmware, retarget it with `port_extract.py` first (see PORTING.md).
+`exploit.c` is built for F731NKSU5EYD9. 
+
+For other firmware, retarget it with `port_extract.py` first (see PORTING.md)
 
 ```bash
 # build exploit.c with the Android NDK (aarch64), e.g.:
@@ -55,15 +57,19 @@ adb push cheese /data/local/tmp/
 adb shell 'chmod +x /data/local/tmp/cheese; /data/local/tmp/cheese'
 ```
 
-Run once per boot (the root server is not persistent). On success it leaves a root `toybox nc`
-listener bound to loopback (127.0.0.1:4444). Get a root shell from `adb shell`:
+Run once per boot (the root server is not persistent). 
+
+On success it leaves a root `toybox nc` listener bound to loopback (127.0.0.1:4444). Get a root shell from `adb shell`:
 
 ```bash
 adb shell
 nc 127.0.0.1 4444          # root shell, uid=0  (u:r:sec_system_init_shell:s0)
 ```
   
-Stock binaries can still run directly. The issue is that DEFEX blocks custom native binaries when executed directly.
+Stock binaries can still run directly. 
+
+The issue is that DEFEX blocks custom native binaries when executed directly.
+
 So instead, run your custom code as an `LD_PRELOAD` library injected into a stock host process from the root shell:
 
 ```bash
